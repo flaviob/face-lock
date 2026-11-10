@@ -17,6 +17,14 @@ func lockScreen() {
     }
 }
 
+/// Append a line to ~/Library/Logs/FaceLock.log
+func log(_ msg: String) {
+    let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/FaceLock.log")
+    let line = "\(ISO8601DateFormatter().string(from: Date())) \(msg)\n"
+    if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); try? h.close() }
+    else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+}
+
 /// Seconds since last keyboard/mouse/trackpad input.
 func secondsSinceInput() -> Double {
     CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
@@ -27,11 +35,13 @@ final class FaceWatcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "facelock.camera")
     private var lastCheck = Date.distantPast
+    private var lastPresent = false
     var lastFaceSeen = Date()
     var cameraError: String?
 
     func configure() {
-        session.sessionPreset = .low
+        // .low is 192x144: too small for Vision to find a face at desk distance.
+        session.sessionPreset = session.canSetSessionPreset(.vga640x480) ? .vga640x480 : .medium
         guard let device = AVCaptureDevice.default(for: .video),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else { cameraError = "No camera"; return }
@@ -40,6 +50,15 @@ final class FaceWatcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         out.alwaysDiscardsLateVideoFrames = true
         out.setSampleBufferDelegate(self, queue: queue)
         if session.canAddOutput(out) { session.addOutput(out) }
+        // Restart if another app grabs the camera or it errors out.
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { _ in
+            log("camera runtime error, restarting"); self.stop(); self.start()
+        }
+        nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { _ in
+            log("camera interruption ended"); self.start()
+        }
+        log("camera configured: \(device.localizedName), preset \(session.sessionPreset.rawValue)")
     }
 
     func start() { lastFaceSeen = Date(); queue.async { if !self.session.isRunning { self.session.startRunning() } } }
@@ -49,11 +68,14 @@ final class FaceWatcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
         guard Date().timeIntervalSince(lastCheck) >= 1 else { return }   // 1 check per second
         lastCheck = Date()
         guard let pixels = CMSampleBufferGetImageBuffer(buffer) else { return }
-        let req = VNDetectFaceRectanglesRequest()
-        try? VNImageRequestHandler(cvPixelBuffer: pixels, options: [:]).perform([req])
-        if let faces = req.results, !faces.isEmpty {
-            DispatchQueue.main.async { self.lastFaceSeen = Date() }
-        }
+        // Face OR head-and-shoulders counts as present (covers looking down or turned away).
+        let faceReq = VNDetectFaceRectanglesRequest()
+        let bodyReq = VNDetectHumanRectanglesRequest()
+        bodyReq.upperBodyOnly = true
+        try? VNImageRequestHandler(cvPixelBuffer: pixels, orientation: .up, options: [:]).perform([faceReq, bodyReq])
+        let present = !(faceReq.results ?? []).isEmpty || !(bodyReq.results ?? []).isEmpty
+        if present != lastPresent { lastPresent = present; log(present ? "person seen" : "person lost") }
+        if present { DispatchQueue.main.async { self.lastFaceSeen = Date() } }
     }
 }
 
@@ -111,6 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let noFace = Date().timeIntervalSince(watcher.lastFaceSeen)
         // Typing/mousing counts as "present", so a bad camera angle never locks you out mid-work.
         if noFace >= Double(delay) && secondsSinceInput() >= Double(delay) {
+            log("locking: no person for \(Int(noFace))s, no input for \(Int(secondsSinceInput()))s")
             screenLocked = true
             watcher.stop()
             lockScreen()
